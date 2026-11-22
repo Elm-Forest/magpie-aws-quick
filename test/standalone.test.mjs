@@ -2,12 +2,19 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import { createProxyServer } from '../bin/serve.mjs'
-import { startFakeQuick } from './helpers/fake-quick.mjs'
+import { startFakeQuick, defaultScript } from './helpers/fake-quick.mjs'
 import { toOpenAIRequest } from '../lib/anthropic.mjs'
 
 const baseHeaders = { 'content-type':'application/json', 'x-api-key':'local-test', 'anthropic-version':'2023-06-01' }
-async function withServer(run) {
-  const fake=await startFakeQuick()
+async function withServer(run, script) {
+  const fake=await startFakeQuick({script:script || ((payload)=>{
+    if (!String(payload.text||'').startsWith('[CLIENT TOOL DATA TRANSFER')) return defaultScript(payload)
+    return [
+      {type:'message_start',payload:{message_id:payload.message_id}},
+      {type:'text_delta',payload:{delta:'ACK'}},
+      {type:'message_complete',payload:{text:'ACK',message_id:payload.message_id}},
+    ]
+  })})
   const mgr={ensure:async()=>({
     outpostId:async()=> 'test-device',
     session:async()=>({ws_host:fake.wsHost,id_token:'test-jwt',actor_arn:'arn:test',provider:'social',aws_account_id:'123',usable_until:Math.floor(Date.now()/1000)+600}),
@@ -179,7 +186,16 @@ test('112 tools + long system prompt + parallel results keep short output and hi
     assert.ok(frame.text.includes(small),'short tool output lost during parallel compression')
     assert.ok(frame.text.includes('Review the paper'))
     assert.ok(frame.text.includes('Bash') && frame.text.includes('Read') && frame.text.includes('args {'))
-    assert.equal((frame.text.match(/PARTIAL TOOL RESULT/g)||[]).length, 3)
+    const transfer=fake.state.userMessages.slice(0,-1)
+      .filter(x=>x.payload.text.startsWith('[CLIENT TOOL DATA TRANSFER'))
+    assert.ok(transfer.length>=3,'large results should use upstream staged delivery')
+    const chunks=transfer.map(x=>x.payload.text).join('\n')
+    for(const proof of ['HEAD1:',':TAIL1','HEAD2:',':TAIL2','HEAD3:',':TAIL3'])
+      assert.ok(chunks.includes(proof),proof)
+    assert.ok(frame.text.includes('preceding Quick message'), 'final turn must reference staged results')
+    assert.equal(new Set([...transfer,fake.state.userMessages.at(-1)].map(x=>x.threadId)).size,1,
+      'all frames must share one upstream Quick thread')
+    assert.ok(transfer.every(x=>new TextEncoder().encode(x.payload.text).length<=24*1024))
     assert.ok(new TextEncoder().encode(frame.text).length + new TextEncoder().encode(frame.system_prompt).length <= 62*1024)
   })
 })
