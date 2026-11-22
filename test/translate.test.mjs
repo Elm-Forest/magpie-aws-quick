@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { textOf, modeFor, effortFor, renderTranscript, renderDelta, byteLen, capText, UPSTREAM_TEXT_LIMIT, imagesOf, pickImages, MAX_UPLOAD_IMAGE_BYTES, MAX_UPLOADS, MAX_UPLOAD_TOTAL_BYTES } from '../lib/translate.mjs'
+import { textOf, modeFor, effortFor, renderTranscript, renderDelta, byteLen, capText, UPSTREAM_TEXT_LIMIT, imagesOf, pickImages, MAX_UPLOAD_IMAGE_BYTES, MAX_UPLOADS, MAX_UPLOAD_TOTAL_BYTES, TOOL_RESULT_CAP } from '../lib/translate.mjs'
 
 test('textOf handles strings, parts arrays, and junk', () => {
   assert.equal(textOf('hi'), 'hi')
@@ -124,17 +124,21 @@ test('renderTranscript caps oversized system prompt and user turn', () => {
   assert.ok(out.endsWith('[truncated]')) // user turn itself was capped
 })
 
-test('renderDelta caps oversized tool results per block', () => {
+test('per-tool cap is 512 KiB and retains 30 KiB outputs without clipping', () => {
+  assert.equal(TOOL_RESULT_CAP, 512 * 1024)
   const delta = [
-    { role: 'tool', tool_call_id: 'c1', name: 'read', content: 'F'.repeat(30 * 1024) },
-    { role: 'user', content: 'next' },
+    {role:'tool',tool_call_id:'c1',name:'read',content:'F'.repeat(30 * 1024)},
+    {role:'user',content:'next'},
   ]
-  const stats = {}
-  const out = renderDelta(delta, { stats })
-  assert.ok(stats.truncated)
-  assert.ok(out.includes('[tool_result read c1]'))
+  const stats={}
+  const out=renderDelta(delta,{stats})
+  assert.ok(!stats.truncated, '30 KiB result should remain intact')
+  assert.ok(out.includes('F'.repeat(30 * 1024)))
   assert.ok(out.includes('next'))
-  assert.ok(byteLen(out) < 20 * 1024) // 16KB cap + small user msg
+
+  const huge=renderDelta([{role:'tool',tool_call_id:'huge',name:'Read',content:'H'.repeat(TOOL_RESULT_CAP+1536)}])
+  assert.ok(huge.includes('PARTIAL TOOL RESULT'))
+  assert.ok(byteLen(huge) <= TOOL_RESULT_CAP + 220)
 })
 
 test('renderDelta shares the budget across parallel tool results instead of dropping the oldest', () => {
@@ -188,9 +192,10 @@ test('renderTranscript squeezes stale tool results, keeps fresh ones and all dia
   ]
   const out = renderTranscript(messages, '', { maxBytes: UPSTREAM_TEXT_LIMIT })
   assert.ok(out.includes('FIRST-ASK') && out.includes('MIDDLE-ANSWER'))
-  assert.ok(out.includes('STALE') && out.includes('PARTIAL TOOL RESULT')) // stale result squeezed, not dropped
-  assert.ok(out.includes('f'.repeat(8 * 1024))) // fresh result fits whole
-  assert.ok(byteLen(out) < 16 * 1024)
+  assert.ok(out.includes('STALE'+'s'.repeat(12 * 1024)), 'old 2 KiB cap must not destroy history')
+  assert.ok(out.includes('f'.repeat(8 * 1024)))
+  assert.ok(byteLen(out) > 20 * 1024)
+  assert.ok(byteLen(out) <= UPSTREAM_TEXT_LIMIT)
 })
 
 test('imagesOf reads OpenAI, Responses, Anthropic and nested tool_result image shapes', () => {
