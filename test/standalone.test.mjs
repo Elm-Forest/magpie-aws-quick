@@ -302,3 +302,100 @@ test('Desktop CC Switch OpenAI route: long session keeps both latest results wit
     assert.equal(new Set(msgs.map(x=>x.threadId)).size,1)
   })
 })
+
+test('OpenAI Chat / Claude Desktop: choice markup becomes readable Markdown in stream and nonstream',async()=>{
+  const raw=[
+    '论文已核查。',
+    '',
+    '<decision question="接下来怎么办？">',
+    '<option description="先确认数据再继续">继续修改论文</option>',
+    '<option>仅汇报结果</option>',
+    '</decision>',
+  ].join('\n')
+  const script=(payload)=>{
+    const parts=[]
+    for(let i=0;i<raw.length;i+=2)parts.push({type:'text_delta',payload:{delta:raw.slice(i,i+2)}})
+    return [
+      {type:'message_start',payload:{message_id:payload.message_id}},
+      ...parts,
+      {type:'message_complete',payload:{text:raw,message_id:payload.message_id}},
+    ]
+  }
+  await withServer(async(url,fake)=>{
+    const headers={authorization:'Bearer local-test','content-type':'application/json'}
+    for(const stream of [false,true]) {
+      const response=await fetch(url+'/v1/chat/completions',{
+        method:'POST',headers,
+        body:JSON.stringify({model:'smart',stream,messages:[{role:'user',content:'继续论文任务'}]}),
+      })
+      assert.equal(response.status,200)
+      let visible
+      if(stream){
+        const sse=await response.text()
+        visible=sse.split('\n').filter(x=>x.startsWith('data: ') && x!=='data: [DONE]')
+          .map(x=>JSON.parse(x.slice(6)).choices?.[0]?.delta?.content??'').join('')
+      }else visible=(await response.json()).choices[0].message.content
+      assert.ok(visible.includes('论文已核查。'))
+      assert.ok(visible.includes('**接下来怎么办？**'))
+      assert.ok(visible.includes('- 继续修改论文 — 先确认数据再继续'))
+      assert.ok(visible.includes('- 仅汇报结果'))
+      assert.ok(!visible.includes('<decision'))
+      assert.ok(!visible.includes('<option'))
+      assert.ok(!visible.includes('</decision>'))
+      assert.ok(fake.state.userMessages.at(-1).payload.custom_prompt.includes('NEVER emit XML-like interface tags'))
+    }
+  },script)
+})
+
+test('Anthropic Messages streaming: decision filter preserves protocol events',async()=>{
+  const raw='Done.\n<decision question="下一步？"><option>继续</option></decision>'
+  const script=(payload)=>[
+    {type:'message_start',payload:{message_id:payload.message_id}},
+    {type:'text_delta',payload:{delta:raw.slice(0,12)}},
+    {type:'text_delta',payload:{delta:raw.slice(12,25)}},
+    {type:'text_delta',payload:{delta:raw.slice(25)}},
+    {type:'message_complete',payload:{text:raw,message_id:payload.message_id}},
+  ]
+  await withServer(async(url)=>{
+    const response=await fetch(url+'/v1/messages',{
+      method:'POST',headers:baseHeaders,
+      body:JSON.stringify({model:'claude-opus-5',max_tokens:150,stream:true,
+        messages:[{role:'user',content:'下一步'}]}),
+    })
+    assert.equal(response.status,200)
+    const content=await response.text()
+    for(const tag of ['event: message_start','event: content_block_delta','event: message_stop'])assert.ok(content.includes(tag))
+    assert.ok(content.includes('**下一步？**'))
+    assert.ok(!content.includes('<decision'))
+  },script)
+})
+
+test('client function-call markers remain proper OpenAI tool_calls while decision markup is normalized',async()=>{
+  const raw=[
+    '<tool_call>{"name":"Read","arguments":{"file_path":"main.tex"}}</tool_call>',
+    '<decision question="修改？"><option>继续检查</option></decision>',
+  ].join('\n')
+  const script=(payload)=>[
+    {type:'message_start',payload:{message_id:payload.message_id}},
+    {type:'text_delta',payload:{delta:raw.slice(0,14)}},
+    {type:'text_delta',payload:{delta:raw.slice(14,61)}},
+    {type:'text_delta',payload:{delta:raw.slice(61)}},
+    {type:'message_complete',payload:{text:raw,message_id:payload.message_id}},
+  ]
+  await withServer(async(url)=>{
+    const response=await fetch(url+'/v1/chat/completions',{
+      method:'POST',headers:{authorization:'Bearer local-test','content-type':'application/json'},
+      body:JSON.stringify({model:'smart',max_tokens:200,
+        tools:[{type:'function',function:{name:'Read',parameters:{type:'object',properties:{file_path:{type:'string'}}}}}],
+        messages:[{role:'user',content:'Read my paper'}]}),
+    })
+    assert.equal(response.status,200)
+    const answer=await response.json()
+    const choice=answer.choices[0]
+    assert.equal(choice.finish_reason,'tool_calls')
+    assert.equal(choice.message.tool_calls[0].function.name,'Read')
+    assert.deepEqual(JSON.parse(choice.message.tool_calls[0].function.arguments),{file_path:'main.tex'})
+    assert.ok(choice.message.content.includes('**修改？**'))
+    assert.ok(!choice.message.content.includes('<decision'))
+  },script)
+})
