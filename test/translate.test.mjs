@@ -341,3 +341,28 @@ test('tool output with zero available body is explicitly labelled PARTIAL', () =
   assert.ok(out.includes('CURRENT'))
   assert.ok(out.includes('PARTIAL'), 'missing partial label for an empty or truncated tool output')
 })
+
+
+test('regression: long Claude Code session retains latest 537- and 802-byte tool results', () => {
+  const history = []
+  for (let i=0;i<28;i++) {
+    history.push({role:'user',content:'Historical request '+i+' '+'Q'.repeat(700)})
+    history.push({role:'assistant',content:'Historical answer '+i+' '+'A'.repeat(1000)})
+    history.push({role:'tool',tool_call_id:'old'+i,content:'old_result '+i+' '+'r'.repeat(180)})
+  }
+  const first='FIRST_OUTPUT_537_'+'1'.repeat(520)
+  const second='SECOND_OUTPUT_802_'+'2'.repeat(784)
+  history.push({role:'assistant',content:'Check project files',tool_calls:[
+    {id:'call_1',function:{name:'Bash',arguments:'{}'}},
+    {id:'call_2',function:{name:'Bash',arguments:'{}'}},
+  ]})
+  history.push({role:'tool',tool_call_id:'call_1',content:first})
+  history.push({role:'tool',tool_call_id:'call_2',content:second})
+  const stats={}
+  const out=renderTranscript(history,'',{maxBytes:23092,stats})
+  assert.ok(out.includes(first),'537-byte output lost amid old transcript')
+  assert.ok(out.includes(second),'802-byte output lost amid old transcript')
+  assert.ok(out.includes('Check project files'))
+  assert.ok(byteLen(out)<=23092)
+  assert.ok(stats.droppedHistory>0)
+})

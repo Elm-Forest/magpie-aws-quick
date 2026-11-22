@@ -86,7 +86,8 @@ export function createProxyServer({ options = {}, token = '', outpostMgr, sessio
         const { mgr, identity } = chooseBackend()
         const sessionKey = ['x-magpie-session', 'x-session-id', 'x-session-affinity', 'x-client-request-id', 'x-thread-id', 'x-conversation-id']
           .map((h) => req.headers[h]).find((x) => typeof x === 'string' && x.trim())
-        const opts = { ...options, identity, sessionKey, log }
+        const opts = { ...options, identity, sessionKey, log,
+          disableToolRelay: /^(0|false|off|no)$/i.test(process.env.QUICK_TOOL_RELAY ?? '') }
         const openai = await handleChatCompletions({
           body, outpostMgr: mgr, options: opts, sessions,
           effortHeader: req.headers['x-magpie-effort'], signal: ac.signal,
