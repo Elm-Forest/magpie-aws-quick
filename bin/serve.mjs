@@ -111,7 +111,9 @@ async function requestBody(req) {
   const parts = []
   for await (const chunk of req) {
     total += chunk.length
-    if (total > 8 * 1024 * 1024) throw new Error('Request too large')
+    // Long client-side histories may embed 512 KiB tool outputs. Accept a
+    // larger local HTTP body; the Quick upstream still receives bounded frames.
+    if (total > 32 * 1024 * 1024) throw new Error('Request too large (32 MiB max)')
     parts.push(chunk)
   }
   return Buffer.concat(parts).toString('utf8')

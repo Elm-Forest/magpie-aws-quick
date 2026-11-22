@@ -1,6 +1,6 @@
 import {test} from 'node:test'
 import assert from 'node:assert/strict'
-import {planToolRelay,deliverToolRelay,RELAY_FRAME_LIMIT} from '../lib/relay.mjs'
+import {planToolRelay,deliverToolRelay,RELAY_FRAME_LIMIT,RELAY_SINGLE_TOOL_LIMIT,RELAY_TOTAL_LIMIT,RELAY_MAX_FRAMES} from '../lib/relay.mjs'
 import {byteLen} from '../lib/translate.mjs'
 import {startFakeQuick,defaultScript} from './helpers/fake-quick.mjs'
 import {QuickSocket} from '../lib/quickws.mjs'
@@ -97,4 +97,41 @@ test('packs 100 medium-size tool results into a handful of Quick turns',()=>{
       assert.ok(packed.includes(tool.content),'lost packed result '+tool.tool_call_id)
   }
   assert.ok(plan.replacements.size>=70)
+})
+
+
+test('512 KiB single tool output survives UTF-8 staged transport exactly',()=>{
+  const input = 'HEADER-512K\n' + '数值😀'.repeat(40000)
+  const sized = input + 'Z'.repeat(512 * 1024 - byteLen(input) - byteLen('\nTAIL-512K')) + '\nTAIL-512K'
+  assert.equal(byteLen(sized),512 * 1024)
+  const tool={role:'tool',tool_call_id:'tool-large',name:'Read',content:sized}
+  const plan=planToolRelay([tool],23000)
+  assert.ok(plan.frames.length>=25 && plan.frames.length<=40)
+  assert.ok(plan.frames.every(frame=>byteLen(frame)<=RELAY_FRAME_LIMIT))
+  const recovered=[]
+  for(const frame of plan.frames) {
+    const match=frame.match(/\[tool_result Read tool-large part \d+\/\d+\]\n([\s\S]*?)\n\[\/tool_result\]/)
+    assert.ok(match)
+    recovered.push(match[1])
+  }
+  assert.equal(recovered.join(''),sized)
+  assert.equal(RELAY_SINGLE_TOOL_LIMIT,512*1024)
+  assert.ok(RELAY_TOTAL_LIMIT>=8*1024*1024)
+  assert.ok(RELAY_MAX_FRAMES>=512)
+})
+
+test('forced staging protects otherwise-small 537/802 byte results',()=>{
+  const a={role:'tool',tool_call_id:'small1',content:'S'.repeat(537)}
+  const b={role:'tool',tool_call_id:'small2',content:'T'.repeat(802)}
+  assert.equal(planToolRelay([a,b],23000),null)
+  const plan=planToolRelay([a,b],23000,{forceMessages:new Set([b])})
+  assert.ok(plan)
+  assert.ok(plan.replacements.has(b),'forced tool result must stage')
+  assert.ok(!plan.replacements.has(a),'other result stays inline')
+  assert.ok(plan.frames.join('').includes('T'.repeat(802)))
+})
+
+test('individual result beyond 512 KiB fails clearly rather than clipping',()=>{
+  const tool={role:'tool',tool_call_id:'too_big',content:'X'.repeat(RELAY_SINGLE_TOOL_LIMIT+1)}
+  assert.throws(()=>planToolRelay([tool],23000),e=>e.status===413 && /512 KiB/.test(e.message))
 })

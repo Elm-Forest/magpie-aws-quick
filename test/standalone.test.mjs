@@ -71,6 +71,7 @@ test('tool_use and tool_result conversion preserve local tool calls',()=>{
   assert.equal(output.messages[1].tool_calls[0].function.name,'read_file')
   assert.equal(output.messages[2].role,'tool')
   assert.equal(output.messages[2].tool_call_id,'toolu_1')
+  assert.equal(output.messages[2].name,'read_file')
 })
 test('token count and bad message JSON',async()=>{
   await withServer(async url=>{
@@ -197,5 +198,44 @@ test('112 tools + long system prompt + parallel results keep short output and hi
       'all frames must share one upstream Quick thread')
     assert.ok(transfer.every(x=>new TextEncoder().encode(x.payload.text).length<=24*1024))
     assert.ok(new TextEncoder().encode(frame.text).length + new TextEncoder().encode(frame.system_prompt).length <= 62*1024)
+  })
+})
+
+
+test('512 KiB client output survives Anthropic HTTP -> bounded Quick relay unmodified',async()=>{
+  await withServer(async(url,fake)=>{
+    const header='LARGE-512KB-START\n'
+    const tail='\nLARGE-512KB-END'
+    const payload=header+'汉字'.repeat(20000)+'Y'.repeat(512*1024-Buffer.byteLength(header+'汉字'.repeat(20000)+tail,'utf8'))+tail
+    assert.equal(Buffer.byteLength(payload,'utf8'),512*1024)
+    const question={
+      model:'claude-opus-5',max_tokens:300,
+      system:'Check file contents',
+      messages:[
+        {role:'user',content:'Read the following tool result fully'},
+        {role:'assistant',content:[{type:'tool_use',id:'large_result',name:'Read',input:{file_path:'large'}}]},
+        {role:'user',content:[{type:'tool_result',tool_use_id:'large_result',content:payload}]},
+      ],
+    }
+    const response=await fetch(url+'/v1/messages',{
+      method:'POST',headers:baseHeaders,body:JSON.stringify(question),
+    })
+    assert.equal(response.status,200)
+    const data=await response.json()
+    assert.equal(data.type,'message')
+    const frames=fake.state.userMessages
+      .filter(x=>x.payload.text.startsWith('[CLIENT TOOL DATA TRANSFER'))
+    assert.ok(frames.length>=25)
+    assert.equal(new Set(fake.state.userMessages.map(x=>x.threadId)).size,1)
+    const recovered=[]
+    for(const frame of frames) {
+      assert.ok(Buffer.byteLength(frame.payload.text,'utf8')<=24*1024)
+      const parts=frame.payload.text.matchAll(
+        /\[tool_result Read large_result part \d+\/\d+\]\n([\s\S]*?)\n\[\/tool_result\]/g)
+      for(const part of parts)recovered.push(part[1])
+    }
+    assert.equal(recovered.join(''),payload)
+    assert.ok(fake.state.userMessages.at(-1).payload.text.includes('preceding Quick message'))
+    assert.ok(!fake.state.userMessages.at(-1).payload.text.includes('TRUNCATED 524288'))
   })
 })
