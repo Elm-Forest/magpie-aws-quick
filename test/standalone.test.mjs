@@ -74,3 +74,16 @@ test('token count and bad message JSON',async()=>{
     assert.equal(res.status,400)
   })
 })
+
+test('Claude Code-injected system messages are accepted',()=>{
+  const result=toOpenAIRequest({
+    model:'claude-opus-4-5',
+    messages:[
+      {role:'user',content:[{type:'text',text:'hello'}]},
+      {role:'system',content:[{type:'text',text:'You are an assistant with local tools'}]},
+    ],
+  })
+  assert.equal(result.messages.length,2)
+  assert.equal(result.messages[1].role,'system')
+  assert.match(result.messages[1].content,/local tools/)
+})
