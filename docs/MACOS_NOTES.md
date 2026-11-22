@@ -39,3 +39,14 @@
 - 发送前核对最新工具结果原文。短结果如因历史对话占用预算而未进入最终消息，将自动转为分帧传输。若依然无法完整送达，则返回显式错误。
 - 升级后的会话作用域会避开旧版可能存有截断结果的 Quick 缓存线程。OAuth 账号、API Key 和端口配置保持原样。
 - 512 KiB 是客户端向代理提交且可分帧发送的字节上限，不代表模型保证逐字记忆 512 KiB。科研数值核对应通过本地程序保存完整审计文件。
+
+## Claude Desktop + CC Switch：工具结果被误判为 PARTIAL（2026-11-23）
+
+根据 Desktop 内嵌 Claude Code 的本地真实会话记录，原始工具输出 3452 B、17442 B、29443 B 完整；CC Switch 的转发日志显示进入本代理的 OpenAI Chat 接口，模型 smart，端口 8810。这不属于独立 Claude Code CLI 验证。
+
+- 新 Quick 线程重建长历史时，旧版本会把陈旧工具结果压成带 PARTIAL 标记的头尾，污染新请求。新版直接省略历史工具结果正文，当前工具结果保持完整；超过预算走分帧，不可交付则明确失败。
+- 以最近实际 tool_calls 消息识别当前结果，不让纯文本 Assistant 消息误判工具调用边界。
+- 更新线程组版本 desktop-fresh-tools-v4，避免继承之前 Quick 线程的错误标记。
+- 可选元数据诊断：在用户数据目录新建空文件 .enable-transport-audit；transport-audit.jsonl 记录仅数字和时间，包括消息数、当前工具结果数量及字节数、分帧数、上下文预算和生成 PARTIAL 数量。绝不记录用户 Prompt、工具正文、文件路径、账号或 API Key。权限 0600，512 KiB 轮转。删除标记文件即可关闭。
+- CC Switch 选择 Claude Desktop 代理模式、OpenAI Chat 格式，Base URL 为 http://127.0.0.1:8810/v1，模型路由 Opus->smart、Sonnet->balanced、Haiku->fast、Fable->advanced；不建议将 supports1m 设为 true。
+- 新测试复现 Desktop OpenAI Chat 的 45 组历史 tool_call/result、112 工具定义、31KB 系统提示和 300/60 行输出，在模拟 Quick 的完整 HTTP 链路中验证。真实 Desktop GUI 的恢复必须由后续实际请求确认。

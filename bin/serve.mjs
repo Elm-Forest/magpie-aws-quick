@@ -12,7 +12,7 @@
 //   QUICK_SESSION_REUSE=0               # send every request on a fresh Quick thread
 //   QUICK_SESSION_TTL_MS=1800000  QUICK_SESSION_MAX=200
 import { createServer } from 'node:http'
-import { realpathSync } from 'node:fs'
+import { realpathSync, existsSync, appendFileSync, statSync, renameSync, chmodSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { resolve, join } from 'node:path'
 import { handleChatCompletions, handleModels } from '../lib/handler.mjs'
@@ -26,6 +26,24 @@ export function createProxyServer({ options = {}, token = '', outpostMgr, sessio
   const fallback = outpostMgr ?? createOutpostManager(options)
   let nextAccount = 0
   const managers = new Map()
+  // Opt-in transport diagnostics contain COUNTS ONLY, never prompts,
+  // tool results, OAuth material, API keys, paths or tool call identifiers.
+  // Enable by creating <dataDir>/.enable-transport-audit (mode 0600).
+  const diagDir = options.sessionDir || defaultStoreDir()
+  const diagFlag = join(diagDir, '.enable-transport-audit')
+  const diagFile = join(diagDir, 'transport-audit.jsonl')
+  const trace = (data) => {
+    if (!existsSync(diagFlag)) return
+    try {
+      if (existsSync(diagFile) && statSync(diagFile).size > 512 * 1024) {
+        renameSync(diagFile, diagFile + '.previous')
+      }
+      appendFileSync(diagFile, JSON.stringify({
+        timestamp: new Date().toISOString(), ...data,
+      }) + '\n', {mode:0o600})
+      chmodSync(diagFile,0o600)
+    } catch { /* Diagnostics must never interrupt model traffic. */ }
+  }
   // Choose one account per turn; identity isolates persisted Quick threads.
   function chooseBackend() {
     const accounts = store.list()
@@ -46,7 +64,7 @@ export function createProxyServer({ options = {}, token = '', outpostMgr, sessio
       const path = url.pathname.replace(/\/+$/, '') || '/'
       if (req.method === 'GET' && (path === '/health' || path === '/healthz' || path === '/')) {
         res.writeHead(200, { 'content-type': 'application/json' })
-        return res.end(JSON.stringify({ ok: true, service: 'magpie-quick-mac' }))
+        return res.end(JSON.stringify({ok:true,service:'magpie-quick-mac',transport_version:'desktop-fresh-tools-v4',tool_result_limit_bytes:524288}))
       }
       if (token) {
         const got = (req.headers.authorization || '').replace(/^Bearer\s+/i, '') || req.headers['x-api-key'] || ''
@@ -83,10 +101,23 @@ export function createProxyServer({ options = {}, token = '', outpostMgr, sessio
             return send(res, anthropicErrorResponse(400, 'invalid_request_error', String(e?.message || e)))
           }
         }
+        const toolLengths = (Array.isArray(body.messages) ? body.messages : [])
+          .filter((m) => m?.role === 'tool' || m?.role === 'function')
+          .map((m) => Buffer.byteLength(typeof m.content === 'string'
+            ? m.content : JSON.stringify(m.content ?? '')))
+        trace({
+          phase:'ingress',
+          dialect:isAnthropic ? 'anthropic' : 'openai_chat',
+          messageCount:Array.isArray(body.messages) ? body.messages.length : 0,
+          declaredTools:Array.isArray(body.tools) ? body.tools.length : 0,
+          toolCount:toolLengths.length,
+          latestToolByteSizes:toolLengths.slice(-8),
+          largestToolBytes:Math.max(0,...toolLengths),
+        })
         const { mgr, identity } = chooseBackend()
         const sessionKey = ['x-magpie-session', 'x-session-id', 'x-session-affinity', 'x-client-request-id', 'x-thread-id', 'x-conversation-id']
           .map((h) => req.headers[h]).find((x) => typeof x === 'string' && x.trim())
-        const opts = { ...options, identity, sessionKey, log,
+        const opts = { ...options, identity, sessionKey, log, trace,
           disableToolRelay: /^(0|false|off|no)$/i.test(process.env.QUICK_TOOL_RELAY ?? '') }
         const openai = await handleChatCompletions({
           body, outpostMgr: mgr, options: opts, sessions,

@@ -239,3 +239,66 @@ test('512 KiB client output survives Anthropic HTTP -> bounded Quick relay unmod
     assert.ok(!fake.state.userMessages.at(-1).payload.text.includes('TRUNCATED 524288'))
   })
 })
+
+test('Desktop CC Switch OpenAI route: long session keeps both latest results without PARTIAL',async()=>{
+  await withServer(async (url,fake)=>{
+    const old=[]
+    for(let i=0;i<45;i++) {
+      old.push({role:'user',content:'Research note '+i})
+      old.push({role:'assistant',content:null,tool_calls:[{
+        type:'function',id:'old_'+i,function:{name:'Bash',arguments:'{}'},
+      }]})
+      old.push({role:'tool',tool_call_id:'old_'+i,content:JSON.stringify([
+        {type:'text',text:'OLD_LOG_'+i+' '+('x'.repeat(1700))},
+      ])})
+      old.push({role:'assistant',content:'Historical result handled'})
+    }
+    const long='CURRENT_300_LINE_PROOF_START\n'+Array.from({length:300},(_,i)=>
+      'N'+String(i+1).padStart(3,'0')+':'+'L'.repeat(49)).join('\n')+'\nCURRENT_300_LINE_PROOF_END'
+    const short='CURRENT_60_LINE_PROOF_START\n'+Array.from({length:60},(_,i)=>
+      'M'+String(i+1).padStart(3,'0')+':'+'S'.repeat(49)).join('\n')+'\nCURRENT_60_LINE_PROOF_END'
+    const longSerialized=JSON.stringify([{type:'text',text:long}])
+    const shortSerialized=JSON.stringify([{type:'text',text:short}])
+    const tools=Array.from({length:112},(_,i)=>({
+      type:'function',
+      function:{name:'tool_'+i,description:'Local research tool '+i,
+        parameters:{type:'object',properties:{command:{type:'string'}}}},
+    }))
+    const body={
+      model:'smart',stream:false,max_tokens:256,reasoning_effort:'high',
+      tools, messages:[
+        {role:'system',content:'Paper writing assistant '+('Q'.repeat(31000))},
+        ...old,
+        {role:'user',content:'Inspect both current command outputs, retaining all lines.'},
+        {role:'assistant',content:null,tool_calls:[
+          {type:'function',id:'current_300',function:{name:'Bash',arguments:'{}'}},
+          {type:'function',id:'current_60',function:{name:'Bash',arguments:'{}'}},
+        ]},
+        {role:'tool',tool_call_id:'current_300',content:longSerialized},
+        {role:'tool',tool_call_id:'current_60',content:shortSerialized},
+      ],
+    }
+    const response=await fetch(url+'/v1/chat/completions',{
+      method:'POST',
+      headers:{'content-type':'application/json','authorization':'Bearer local-test'},
+      body:JSON.stringify(body),
+    })
+    const json=await response.json()
+    assert.equal(response.status,200,JSON.stringify(json).slice(0,300))
+    const msgs=fake.state.userMessages
+    const final=msgs.at(-1).payload.text
+    const relays=msgs.filter(x=>x.payload.text.startsWith('[CLIENT TOOL DATA TRANSFER'))
+    const upstream=[final,...relays.map(x=>x.payload.text)].join('\n')
+    assert.ok(!upstream.includes('OLD_LOG_'),'stale output replayed')
+    assert.ok(!upstream.includes('[PARTIAL TOOL RESULT:'),'partial injected')
+    assert.ok(!upstream.includes('[TRUNCATED '),'truncated marker injected')
+    assert.ok(!upstream.includes('[tool_result old_'),'old output leaked')
+    for(const [id,content] of [['current_300',longSerialized],['current_60',shortSerialized]]) {
+      const found=final.includes(content)||relays.some(x=>x.payload.text.includes(content))
+        || relays.some(x=>x.payload.text.includes(id)&&x.payload.text.includes(id==='current_300'?'CURRENT_300_LINE_PROOF_START':'CURRENT_60_LINE_PROOF_START'))
+      assert.ok(found,'current result '+id+' was lost')
+    }
+    assert.ok(relays.length>=1)
+    assert.equal(new Set(msgs.map(x=>x.threadId)).size,1)
+  })
+})

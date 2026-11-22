@@ -182,7 +182,7 @@ test('renderDelta still drops oldest text when conversation text alone overflows
   assert.ok(out.endsWith('NEW-QUESTION'))
 })
 
-test('renderTranscript squeezes stale tool results, keeps fresh ones and all dialogue', () => {
+test('renderTranscript omits historical tool bodies while preserving current results', () => {
   const messages = [
     { role: 'user', content: 'FIRST-ASK' },
     { role: 'assistant', content: '', tool_calls: [{ id: 'c1', function: { name: 'read', arguments: '{}' } }] },
@@ -190,11 +190,13 @@ test('renderTranscript squeezes stale tool results, keeps fresh ones and all dia
     { role: 'assistant', content: 'MIDDLE-ANSWER', tool_calls: [{ id: 'c2', function: { name: 'read', arguments: '{}' } }] },
     { role: 'tool', tool_call_id: 'c2', name: 'read', content: 'FRESH' + 'f'.repeat(8 * 1024) },
   ]
-  const out = renderTranscript(messages, '', { maxBytes: UPSTREAM_TEXT_LIMIT })
+  const stats={}
+  const out = renderTranscript(messages, '', { maxBytes: UPSTREAM_TEXT_LIMIT,stats })
   assert.ok(out.includes('FIRST-ASK') && out.includes('MIDDLE-ANSWER'))
-  assert.ok(out.includes('STALE'+'s'.repeat(12 * 1024)), 'old 2 KiB cap must not destroy history')
-  assert.ok(out.includes('f'.repeat(8 * 1024)))
-  assert.ok(byteLen(out) > 20 * 1024)
+  assert.ok(!out.includes('STALE'),'old tool output should not be resurfaced as PARTIAL')
+  assert.ok(out.includes('FRESH'+'f'.repeat(8 * 1024)))
+  assert.ok(!out.includes('PARTIAL'))
+  assert.equal(stats.omittedHistoricalToolResults,1)
   assert.ok(byteLen(out) <= UPSTREAM_TEXT_LIMIT)
 })
 
@@ -370,4 +372,35 @@ test('regression: long Claude Code session retains latest 537- and 802-byte tool
   assert.ok(out.includes('Check project files'))
   assert.ok(byteLen(out)<=23092)
   assert.ok(stats.droppedHistory>0)
+})
+
+
+test('Claude Desktop long history: do not reintroduce PARTIAL from stale tools',()=>{
+  const messages=[]
+  for(let i=0;i<85;i++){
+    messages.push({role:'user',content:'Project step '+i})
+    messages.push({role:'assistant',content:'Read old file',tool_calls:[
+      {id:'old_call_'+i,type:'function',function:{name:'Bash',arguments:'{}'}},
+    ]})
+    messages.push({role:'tool',tool_call_id:'old_call_'+i,content:'OLD_RESULT_'+i+':'+String(i).repeat(950)})
+    messages.push({role:'assistant',content:'Old step complete'})
+  }
+  const freshA='CURRENT_300_LINES_'+Array.from({length:300},(_,i)=>'N'+String(i).padStart(3,'0')+':'+String(i).repeat(35)).join('\n')
+  const freshB='CURRENT_60_LINES_'+Array.from({length:60},(_,i)=>'M'+String(i).padStart(3,'0')+':'+String(i).repeat(30)).join('\n')
+  messages.push({role:'assistant',content:'Check current files',tool_calls:[
+    {id:'new_call_1',type:'function',function:{name:'Bash',arguments:'{}'}},
+    {id:'new_call_2',type:'function',function:{name:'Bash',arguments:'{}'}},
+  ]})
+  messages.push({role:'tool',tool_call_id:'new_call_1',content:freshA})
+  messages.push({role:'tool',tool_call_id:'new_call_2',content:freshB})
+  const stats={}
+  const out=renderTranscript(messages,'',{maxBytes:26*1024,stats})
+  assert.equal(stats.omittedHistoricalToolResults,85)
+  assert.ok(!out.includes('OLD_RESULT_'),'historical tool data must not poison current prompt')
+  assert.ok(!/\[tool_result [^\]\n]+ PARTIAL\]/.test(out))
+  // A standalone renderer can clip current results, but the HTTP handler
+  // must then send them in a relay frame or reject the request.
+  if (stats.partialToolResults) assert.ok(out.includes('new_call_'))
+  assert.ok(!out.includes('[tool_result old_call_'))
+  assert.ok(byteLen(out)<=26*1024)
 })
