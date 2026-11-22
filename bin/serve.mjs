@@ -12,6 +12,7 @@
 //   QUICK_SESSION_REUSE=0               # send every request on a fresh Quick thread
 //   QUICK_SESSION_TTL_MS=1800000  QUICK_SESSION_MAX=200
 import { createServer } from 'node:http'
+import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { resolve, join } from 'node:path'
 import { handleChatCompletions, handleModels } from '../lib/handler.mjs'
@@ -126,7 +127,7 @@ async function send(res, reply) {
   } finally { res.end() }
 }
 
-const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+const isMain = process.argv[1] && realpathSync(resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url))
 if (isMain) {
   const port = Number(process.env.PORT || 3426)
   const host = process.env.HOST || '127.0.0.1'

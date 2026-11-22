@@ -74,3 +74,51 @@ test('token count and bad message JSON',async()=>{
     assert.equal(res.status,400)
   })
 })
+
+test('Claude Code-injected system messages are accepted',()=>{
+  const result=toOpenAIRequest({
+    model:'claude-opus-4-5',
+    messages:[
+      {role:'user',content:[{type:'text',text:'hello'}]},
+      {role:'system',content:[{type:'text',text:'You are an assistant with local tools'}]},
+    ],
+  })
+  assert.equal(result.messages.length,2)
+  assert.equal(result.messages[1].role,'system')
+  assert.match(result.messages[1].content,/local tools/)
+})
+
+
+test('OAuth account route uses direct Quick websocket backend', async () => {
+  const fake = await startFakeQuick()
+  const record = {
+    jwt: 'fake-session-jwt',
+    ws_host: fake.wsHost,
+    actor_arn: 'arn:test',
+    provider: 'social',
+    usable_until: Math.floor(Date.now() / 1000) + 3600,
+  }
+  const store = {
+    list: () => ['oauth-test'],
+    get: () => record,
+    set: (_key, session) => Object.assign(record, session),
+  }
+  const server = createProxyServer({ oauthStore: store, token: 'oauth-test-key' })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  try {
+    const url = 'http://127.0.0.1:' + server.address().port
+    const res = await fetch(url + '/v1/messages', {
+      method: 'POST',
+      headers: {'content-type':'application/json', 'x-api-key':'oauth-test-key'},
+      body: JSON.stringify({model:'smart',messages:[{role:'user',content:'hello'}]}),
+    })
+    const answer = await res.json()
+    assert.equal(res.status, 200)
+    assert.equal(answer.type, 'message')
+    assert.ok(answer.content.length > 0)
+  } finally {
+    await new Promise(done => server.close(done))
+    await fake.close()
+  }
+})
