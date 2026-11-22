@@ -151,7 +151,7 @@ test('renderDelta shares the budget across parallel tool results instead of drop
   assert.ok(out.endsWith('final question'))
   for (const h of ['[tool_result a c1]', '[tool_result b c2]', '[tool_result c c3]']) assert.ok(out.includes(h), h)
   assert.ok(!out.includes('earlier message(s) omitted'))
-  assert.equal((out.match(/middle omitted/g) || []).length, 3)
+  assert.equal((out.match(/PARTIAL TOOL RESULT/g) || []).length, 3)
 })
 
 test('renderDelta keeps small results whole and squeezes only the large one', () => {
@@ -163,7 +163,7 @@ test('renderDelta keeps small results whole and squeezes only the large one', ()
   assert.ok(byteLen(out) <= 8 * 1024)
   assert.ok(out.includes('tiny output'))
   assert.ok(out.includes('HEAD') && out.includes('TAIL-ERROR')) // head + tail both survive
-  assert.ok(out.includes('re-run the tool'))
+  assert.ok(out.includes('PARTIAL TOOL RESULT'))
 })
 
 test('renderDelta still drops oldest text when conversation text alone overflows', () => {
@@ -188,7 +188,7 @@ test('renderTranscript squeezes stale tool results, keeps fresh ones and all dia
   ]
   const out = renderTranscript(messages, '', { maxBytes: UPSTREAM_TEXT_LIMIT })
   assert.ok(out.includes('FIRST-ASK') && out.includes('MIDDLE-ANSWER'))
-  assert.ok(out.includes('STALE') && out.includes('middle omitted')) // stale result squeezed, not dropped
+  assert.ok(out.includes('STALE') && out.includes('PARTIAL TOOL RESULT')) // stale result squeezed, not dropped
   assert.ok(out.includes('f'.repeat(8 * 1024))) // fresh result fits whole
   assert.ok(byteLen(out) < 16 * 1024)
 })
@@ -273,4 +273,57 @@ test('pickImages upload caps: count, per-image size and total bytes', () => {
   const r4 = pickImages([{ role: 'user', content: [imgPart(two), imgPart(two)] }], 1024, { upload: true })
   assert.equal(r4.toUpload.length, 1)
   assert.equal(r4.skipped, 1)
+})
+
+
+test('parallel results: preserve a 163-byte result alongside three oversized outputs', () => {
+  const brief = 'SHORT-RESULT-MARKER-' + 'z'.repeat(143)
+  assert.equal(byteLen(brief), 163)
+  const delta = [
+    { role: 'tool', name: 'Bash', tool_call_id: 'large1', content: 'HEAD1:' + 'A'.repeat(23120) + ':TAIL1' },
+    { role: 'tool', name: 'Read', tool_call_id: 'large2', content: 'HEAD2:' + 'B'.repeat(18455) + ':TAIL2' },
+    { role: 'tool', name: 'Bash', tool_call_id: 'large3', content: 'HEAD3:' + 'C'.repeat(29391) + ':TAIL3' },
+    { role: 'tool', name: 'Bash', tool_call_id: 'small', content: brief },
+    { role: 'user', content: 'NEXT QUESTION' },
+  ]
+  const stats = {}
+  const out = renderDelta(delta, { maxBytes: 9 * 1024, stats })
+  assert.ok(stats.truncated)
+  assert.ok(out.includes(brief), 'the 163-byte result must survive exactly')
+  assert.ok(out.includes('NEXT QUESTION'))
+  for (const id of ['large1', 'large2', 'large3', 'small']) assert.ok(out.includes(id))
+  assert.equal((out.match(/PARTIAL TOOL RESULT/g) || []).length, 3)
+  assert.ok(byteLen(out) <= 9 * 1024)
+})
+
+test('UTF-8 output budgets never overflow or erase last user instruction', () => {
+  // Regression for multibyte text, near-empty budgets, and concurrent results.
+  for (const budget of [128, 256, 512, 1024, 4096, 8192, 16384]) {
+    const delta = [
+      { role: 'tool', name: 'Read', tool_call_id: 'c1', content: '数据'.repeat(2000) },
+      { role: 'tool', name: 'Bash', tool_call_id: 'c2', content: 'ERROR ' + '错'.repeat(3000) },
+      { role: 'user', content: 'NOW' },
+    ]
+    const out = renderDelta(delta, { maxBytes: budget })
+    assert.ok(byteLen(out) <= budget, 'exceeded budget ' + budget)
+    assert.ok(out.includes('NOW'), 'lost current user instruction at ' + budget)
+  }
+})
+
+
+test('byte-budget allocation is invariant across many tool result shapes', () => {
+  // Fixed deterministic PRNG for reproducible stress tests.
+  let seed = 20261123
+  const rand = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed }
+  for (let trial = 0; trial < 250; trial++) {
+    const tools = Array.from({length: 1 + (rand() % 14)}, (_, i) => ({
+      role:'tool',name:'Read',tool_call_id:'c'+i,
+      content: ('中文' + i + 'X').repeat(rand() % 2600),
+    }))
+    const delta = [{role:'user',content:'QUESTION-PROOF'},...tools]
+    const budget = 128 + (rand() % 22000)
+    const out = renderDelta(delta, {maxBytes:budget})
+    assert.ok(byteLen(out) <= budget, 'budget overrun in trial '+trial)
+    assert.ok(out.includes('QUESTION-PROOF'), 'current question missing in trial '+trial)
+  }
 })

@@ -122,3 +122,64 @@ test('OAuth account route uses direct Quick websocket backend', async () => {
     await fake.close()
   }
 })
+
+
+test('112 tools + long system prompt + parallel results keep short output and high effort', async () => {
+  await withServer(async (url, fake) => {
+    const names = ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Agent', 'Task', 'ListAgents']
+    const tools = Array.from({ length: 112 }, (_, i) => {
+      const name = names[i] || 'integration_tool_' + i
+      return {
+        name,
+        description: 'Task-related tool ' + i + ' ' + 'schema documentation '.repeat(15),
+        input_schema: {
+          type: 'object',
+          required: ['path'],
+          properties: {
+            path: {type:'string',description:'local target path'},
+            command: {type:'string'},
+            content: {type:'string'},
+            parameter1: {type:'string'},
+          },
+        },
+      }
+    })
+    const small = 'SHORT-163-' + 'x'.repeat(153)
+    assert.equal(small.length, 163)
+    const body = {
+      model: 'claude-opus-5',
+      max_tokens: 500,
+      output_config: {effort:'high'},
+      system: [{type:'text',text:'You are working on a research paper. ' + 'S'.repeat(31000)}],
+      tools,
+      messages: [
+        {role:'user',content:'Review the paper and check all tool results.'},
+        {role:'assistant',content: [
+          {type:'tool_use',id:'tool_1',name:'Bash',input:{command:'a'}},
+          {type:'tool_use',id:'tool_2',name:'Read',input:{path:'b'}},
+          {type:'tool_use',id:'tool_3',name:'Bash',input:{command:'c'}},
+          {type:'tool_use',id:'tool_4',name:'Bash',input:{command:'d'}},
+        ]},
+        {role:'user',content: [
+          {type:'tool_result',tool_use_id:'tool_1',content:'HEAD1:'+'A'.repeat(23120)+':TAIL1'},
+          {type:'tool_result',tool_use_id:'tool_2',content:'HEAD2:'+'B'.repeat(18455)+':TAIL2'},
+          {type:'tool_result',tool_use_id:'tool_3',content:'HEAD3:'+'C'.repeat(29391)+':TAIL3'},
+          {type:'tool_result',tool_use_id:'tool_4',content:small},
+        ]},
+      ],
+    }
+    const res = await fetch(url+'/v1/messages', {
+      method:'POST',headers:baseHeaders,body:JSON.stringify(body),
+    })
+    assert.equal(res.status, 200)
+    assert.equal((await res.json()).type, 'message')
+    const frame = fake.state.userMessages.at(-1).payload
+    assert.equal(frame.agent_mode,'smart')
+    assert.equal(frame.thinking_effort,'high')
+    assert.ok(frame.text.includes(small),'short tool output lost during parallel compression')
+    assert.ok(frame.text.includes('Review the paper'))
+    assert.ok(frame.text.includes('Bash') && frame.text.includes('Read') && frame.text.includes('args {'))
+    assert.equal((frame.text.match(/PARTIAL TOOL RESULT/g)||[]).length, 3)
+    assert.ok(new TextEncoder().encode(frame.text).length + new TextEncoder().encode(frame.system_prompt).length <= 62*1024)
+  })
+})
