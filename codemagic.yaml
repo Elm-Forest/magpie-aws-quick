@@ -1,0 +1,141 @@
+# Independent macOS build on Codemagic, based on the successful Icey workflow.
+# No Apple Developer credentials: DMG/ZIP are ad-hoc signed, not notarized.
+workflows:
+  magpie-macos-universal:
+    name: Magpie Quick macOS Universal (arm64 + x86_64)
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      xcode: '26.3'
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: main
+          include: true
+          source: true
+    scripts:
+      - name: Verify macOS build host and source revision
+        script: |
+          set -euo pipefail
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          echo "Building $(git rev-parse --short HEAD)"
+          mkdir -p build/dist build/logs
+          printf 'commit=%s\nworkflow=magpie-macos-universal\n' "$(git rev-parse HEAD)" > build/build-info.txt
+
+      - name: Download Node 24 runtime for arm64 and x86_64
+        script: |
+          set -euo pipefail
+          VERSION=v24.11.1
+          mkdir -p build/node
+          for ARCH in arm64 x64; do
+            curl --fail --location --retry 3 --silent --show-error \
+              "https://nodejs.org/dist/$VERSION/node-$VERSION-darwin-$ARCH.tar.gz" \
+              -o "build/node/$ARCH.tgz"
+            mkdir -p "build/node/$ARCH"
+            tar xzf "build/node/$ARCH.tgz" -C "build/node/$ARCH" --strip-components=1
+          done
+          lipo -create build/node/arm64/bin/node build/node/x64/bin/node \
+            -output build/node/node
+          chmod +x build/node/node
+          test "$(lipo -archs build/node/node)" = "x86_64 arm64" \
+            || test "$(lipo -archs build/node/node)" = "arm64 x86_64"
+          build/node/node --version
+
+      - name: Test proxy and Anthropic/OpenAI tool bridge
+        script: |
+          set -euo pipefail
+          build/node/node --test test/*.test.mjs 2>&1 | tee build/logs/tests.log
+          grep -Eq '(^ℹ fail 0$|^# fail 0$)' build/logs/tests.log
+
+      - name: Compile SwiftUI for both Mac CPU architectures
+        script: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk macosx --show-sdk-path)"
+          mkdir -p build/MagpieQuick.app/Contents/{MacOS,Resources}
+          for ARCH in arm64 x86_64; do
+            swiftc -parse-as-library -O -sdk "$SDK" \
+              -target "$ARCH"-apple-macosx13.0 \
+              macos/MagpieQuickApp.swift -o "build/gui-$ARCH" \
+              2>&1 | tee "build/logs/swift-$ARCH.log"
+          done
+          lipo -create build/gui-arm64 build/gui-x86_64 \
+            -output build/MagpieQuick.app/Contents/MacOS/MagpieQuick
+
+      - name: Bundle complete proxy, verify 512 KiB fix and sign app
+        script: |
+          set -euo pipefail
+          APP=build/MagpieQuick.app
+          cp macos/Info.plist "$APP/Contents/Info.plist"
+          mkdir -p "$APP/Contents/Resources/"{app/bin,app/lib,runtime}
+          cp build/node/node "$APP/Contents/Resources/runtime/node"
+          cp bin/*.mjs "$APP/Contents/Resources/app/bin/"
+          cp lib/*.mjs "$APP/Contents/Resources/app/lib/"
+          cp package.json LICENSE "$APP/Contents/Resources/app/"
+          cp build/node/arm64/LICENSE "$APP/Contents/Resources/runtime/LICENSE.node"
+          grep -q 'TOOL_RESULT_CAP = 512 \* 1024' "$APP/Contents/Resources/app/lib/translate.mjs"
+          grep -q 'RELAY_SINGLE_TOOL_LIMIT = 512 \* 1024' "$APP/Contents/Resources/app/lib/relay.mjs"
+          grep -q 'missingFresh' "$APP/Contents/Resources/app/lib/handler.mjs"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+          lipo -archs "$APP/Contents/MacOS/MagpieQuick"
+          lipo -archs "$APP/Contents/Resources/runtime/node"
+
+      - name: Smoke-test bundled OpenAI and Anthropic endpoints
+        script: |
+          set -euo pipefail
+          BUNDLE=build/MagpieQuick.app/Contents/Resources
+          TMP="$(mktemp -d)"
+          PID=''
+          cleanup() {
+            if [ -n "$PID" ]; then kill "$PID" 2>/dev/null || :; wait "$PID" 2>/dev/null || :; fi
+            rm -rf "$TMP"
+          }
+          trap cleanup EXIT
+          MAGPIE_QUICK_DATA_DIR="$TMP" "$BUNDLE/runtime/node" \
+            "$BUNDLE/app/bin/manage.mjs" list > "$TMP/accounts.json"
+          grep -q '"accounts":\[\]' "$TMP/accounts.json"
+          PORT=34567 HOST=127.0.0.1 PROXY_TOKEN=codemagic-smoke \
+            MAGPIE_QUICK_DATA_DIR="$TMP" "$BUNDLE/runtime/node" \
+            "$BUNDLE/app/bin/serve.mjs" > build/logs/server-smoke.log 2>&1 &
+          PID=$!
+          READY=0
+          for i in $(seq 1 60); do
+            if curl --noproxy '*' -fsS --max-time 1 -o /dev/null \
+              http://127.0.0.1:34567/health 2>/dev/null; then READY=1; break; fi
+            sleep .25
+          done
+          test "$READY" -eq 1
+          test "$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' \
+            http://127.0.0.1:34567/v1/models)" = 401
+          curl --noproxy '*' -fsS \
+            -H 'x-api-key: codemagic-smoke' \
+            -H 'anthropic-version: 2023-06-01' \
+            http://127.0.0.1:34567/v1/models | grep -q '"has_more":false'
+          curl --noproxy '*' -fsS \
+            -H 'Authorization: Bearer codemagic-smoke' \
+            http://127.0.0.1:34567/v1/models | grep -q '"object":"list"'
+          echo 'Bundle smoke-test PASS'
+
+      - name: Package universal DMG, ZIP and checksums
+        script: |
+          set -euo pipefail
+          mkdir -p build/dmg build/dist
+          ditto build/MagpieQuick.app build/dmg/MagpieQuick.app
+          ln -s /Applications build/dmg/Applications
+          hdiutil create -volname "Magpie Quick" -srcfolder build/dmg \
+            -format UDZO -ov build/dist/MagpieQuick-macOS-universal.dmg
+          ditto -c -k --sequesterRsrc --keepParent \
+            build/MagpieQuick.app build/dist/MagpieQuick-macOS-universal.zip
+          cd build/dist
+          shasum -a 256 MagpieQuick-macOS-universal.dmg \
+            MagpieQuick-macOS-universal.zip > SHA256SUMS
+          cat SHA256SUMS
+    artifacts:
+      - build/dist/MagpieQuick-macOS-universal.dmg
+      - build/dist/MagpieQuick-macOS-universal.zip
+      - build/dist/SHA256SUMS
+      - build/build-info.txt
+      - build/logs/*.log
