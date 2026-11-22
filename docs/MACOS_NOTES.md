@@ -50,3 +50,16 @@
 - 可选元数据诊断：在用户数据目录新建空文件 .enable-transport-audit；transport-audit.jsonl 记录仅数字和时间，包括消息数、当前工具结果数量及字节数、分帧数、上下文预算和生成 PARTIAL 数量。绝不记录用户 Prompt、工具正文、文件路径、账号或 API Key。权限 0600，512 KiB 轮转。删除标记文件即可关闭。
 - CC Switch 选择 Claude Desktop 代理模式、OpenAI Chat 格式，Base URL 为 http://127.0.0.1:8810/v1，模型路由 Opus->smart、Sonnet->balanced、Haiku->fast、Fable->advanced；不建议将 supports1m 设为 true。
 - 新测试复现 Desktop OpenAI Chat 的 45 组历史 tool_call/result、112 工具定义、31KB 系统提示和 300/60 行输出，在模拟 Quick 的完整 HTTP 链路中验证。真实 Desktop GUI 的恢复必须由后续实际请求确认。
+
+## Claude Desktop：将 Quick 专用决策标记转换为普通文本（2026-11-23）
+
+部分 Quick 模型在普通回答末尾输出 XML 风格的 decision/option 标记，有时还外套 decisions 容器。这些是模型生成的内容，而不是 CC Switch 提供的选项组件，Claude Desktop 不会将其渲染为按钮。
+
+- 每轮 Quick custom_prompt 要求使用普通中文和 Markdown，而非 Quick 专用的交互选择标记；有能力继续执行时不反复要求用户做选择。
+- 新增 lib/decision.mjs 流式归一化：对独占一行且具有完整结束标签的决策块，保留问题、选项与说明，转换为 Markdown 标题和列表；删除单纯的容器标签。支持标签跨多个 text_delta 分片。
+- 不改变代码块内的示例、行内引用、普通 XML 或不完整的标记，也不会抹掉无法识别的输出。
+- 归一化发生在工具调用解析之后、消息返回之前；tool_call、OpenAI tool_calls、Anthropic 工具事件与推理内容保持不变。流式与非流式共同生效。
+- 作用域版本变为 desktop-readable-choices-v5，不复用旧 Quick 线程。
+- 验证：回放现有 Claude Desktop 会话 JSONL 中 11 条带决策标记的历史回答，逐 3 字符推送，11/11 成功转换；模拟 Quick HTTP 全链路覆盖 OpenAI Chat SSE/非流式、Anthropic SSE 以及工具调用。
+
+注意：输出改为普通可读 Markdown 选项，而非可点击表单。Desktop GUI 后续实际回复仍需要验收。
