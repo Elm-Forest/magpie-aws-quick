@@ -26,14 +26,16 @@ test('relays oversized tool outputs in exact bounded Unicode-safe parts',()=>{
   assert.ok(plan.frames.length>=6)
   assert.ok(plan.frames.every(x=>byteLen(x)<=RELAY_FRAME_LIMIT))
   assert.equal(plan.replacements.has(tools[2]),false,'short result should stay inline')
-  const getParts=(id)=>plan.frames.filter(x=>x.includes(' '+id+' part ')).map(x=>{
-    const start=x.indexOf(' part ')
-    assert.ok(start>0)
-    const resultHeader=x.indexOf(']\n',start)
-    const end=x.lastIndexOf('\n[/tool_result]')
-    assert.ok(resultHeader>start && end>resultHeader)
-    return x.slice(resultHeader+2,end)
-  }).join('')
+  const getParts=(id)=>{
+    const parts=[]
+    for(const frame of plan.frames) {
+      const re=/\[tool_result ([^\]\n]+)\]\n([\s\S]*?)\n\[\/tool_result\]/g
+      for(const match of frame.matchAll(re)) {
+        if(match[1].includes(' '+id+' part '))parts.push(match[2])
+      }
+    }
+    return parts.join('')
+  }
   assert.equal(getParts('call_a'),a)
   assert.equal(getParts('call_b'),b)
   assert.ok(plan.replacements.get(tools[0]).includes('preceding Quick'))
@@ -78,4 +80,21 @@ test('a superficially positive but non-ACK response fails closed',async()=>{
       '[CLIENT TOOL DATA TRANSFER 1/1]\nDATA',
     ],{mode:'smart'}),/did not acknowledge/)
   }finally{await ws.close();await fake.close()}
+})
+
+
+test('packs 100 medium-size tool results into a handful of Quick turns',()=>{
+  const tools=Array.from({length:100},(_,i)=>({
+    role:'tool',name:'Bash',tool_call_id:'many_'+i,content:'ROW_'+i+'_'+String(i).padStart(3,'0')+'X'.repeat(540),
+  }))
+  const plan=planToolRelay(tools,23000)
+  assert.ok(plan)
+  assert.ok(plan.frames.length<=5,'packing failed: '+plan.frames.length+' turns')
+  assert.ok(plan.frames.every(x=>byteLen(x)<=RELAY_FRAME_LIMIT))
+  const packed=plan.frames.join('\n')
+  for(const tool of tools) {
+    if(plan.replacements.has(tool))
+      assert.ok(packed.includes(tool.content),'lost packed result '+tool.tool_call_id)
+  }
+  assert.ok(plan.replacements.size>=70)
 })
