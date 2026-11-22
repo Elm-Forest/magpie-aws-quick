@@ -327,3 +327,17 @@ test('byte-budget allocation is invariant across many tool result shapes', () =>
     assert.ok(out.includes('QUESTION-PROOF'), 'current question missing in trial '+trial)
   }
 })
+
+
+test('tool output with zero available body is explicitly labelled PARTIAL', () => {
+  const delta = [
+    {role:'user',content:'CURRENT'},
+    ...Array.from({length:12},(_,i)=>({
+      role:'tool',name:'Read',tool_call_id:'tool'+i,content:'DATA'.repeat(500),
+    })),
+  ]
+  const out=renderDelta(delta,{maxBytes:180})
+  assert.ok(byteLen(out)<=180)
+  assert.ok(out.includes('CURRENT'))
+  assert.ok(out.includes('PARTIAL'), 'missing partial label for an empty or truncated tool output')
+})
